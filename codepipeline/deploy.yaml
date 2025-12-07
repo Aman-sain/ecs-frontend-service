@@ -1,0 +1,16 @@
+service_name: frontend
+subdomain: www
+
+ecs:
+  cpu: 256
+  memory: 512
+  desired_count: 2
+  container_port: 3000
+  health_check_path: /
+
+environment:
+  NODE_ENV: production
+  NEXT_TELEMETRY_DISABLED: "1"
+  NEXT_PUBLIC_API_URL: https://api.webbyftw.co.in/api
+
+ssm_parameters: []
