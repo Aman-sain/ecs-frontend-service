@@ -24,7 +24,7 @@ export function StatsCards({ stats }: StatsCardsProps) {
     },
     {
       title: "Average Salary",
-      value: `₹${stats.average_salary.toLocaleString('en-IN')}`,
+      value: `₹${(stats.average_salary || 0).toLocaleString('en-IN')}`,
       icon: IndianRupee,
       color: "text-green-600 dark:text-green-400",
       bgColor: "bg-green-100 dark:bg-green-900/20",

@@ -115,7 +115,7 @@ Resources:
             - Name: NEXT_TELEMETRY_DISABLED
               Value: "1"
             - Name: NEXT_PUBLIC_API_URL
-              Value: https://api.webbyftw.co.in/api
+              Value: http://api.webbyftw.co.in/api
           LogConfiguration:
             LogDriver: awslogs
             Options:
