@@ -120,7 +120,7 @@ pipeline {
                     # Build image
                     IMAGE_TAG="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/auto-deploy-${SERVICE_NAME}:${BUILD_NUMBER}"
                     echo "Building image: $IMAGE_TAG"
-                    docker build -t $IMAGE_TAG .
+                    docker build --build-arg NEXT_PUBLIC_API_URL=http://api.webbyftw.co.in/api -t $IMAGE_TAG .
 
                     # Push to ECR
                     echo "Pushing image to ECR..."
