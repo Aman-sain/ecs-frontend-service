@@ -152,10 +152,9 @@ pipeline {
                     DESIRED_COUNT=$(python3 -c "import yaml; print(yaml.safe_load(open('codepipeline/deploy.yaml'))['ecs']['desired_count'])")
                     CONTAINER_PORT=$(python3 -c "import yaml; print(yaml.safe_load(open('codepipeline/deploy.yaml'))['ecs']['container_port'])")
 
-                    # Get infrastructure values (VPC, subnets, IAM roles)
                     echo "📊 Fetching infrastructure outputs..."
                     VPC_ID="vpc-02d7f89b03701136a"
-                    SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=${VPC_ID}" --query 'Subnets[*].SubnetId' --output text | tr '\\t' ',')
+                    SUBNET_IDS='subnet-05f141a577517f739,subnet-0707e9e2240b0c1c6,subnet-0fa19e6646dfe40c2'
                     TASK_EXEC_ROLE=$(aws iam get-role --role-name auto-deploy-ecs-execution-role --query 'Role.Arn' --output text)
                     TASK_ROLE=$(aws iam get-role --role-name auto-deploy-ecs-task-role --query 'Role.Arn' --output text)
 
@@ -225,108 +224,104 @@ pipeline {
             }
         }
 
+        stage('🌐 Update DNS') {
+            steps {
+                script {
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "🌐 Updating DNS Record (Direct Access)"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                }
+                sh '''
+                    # Find the running task ARN
+                    echo "🔍 Finding running task..."
+                    TASK_ARN=$(aws ecs list-tasks --cluster ${CLUSTER_NAME} --service-name ${SERVICE_NAME} --desired-status RUNNING --query 'taskArns[0]' --output text --region ${AWS_REGION})
+                    
+                    if [ "$TASK_ARN" == "None" ]; then
+                        echo "❌ No running task found!"
+                        exit 1
+                    fi
+                    
+                    echo "📝 Task ARN: $TASK_ARN"
+
+                    # Get Network Interface ID (ENI)
+                    ENI_ID=$(aws ecs describe-tasks --cluster ${CLUSTER_NAME} --tasks $TASK_ARN --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text --region ${AWS_REGION})
+                    echo "🔌 ENI ID: $ENI_ID"
+
+                    # Get Public IP
+                    PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query 'NetworkInterfaces[0].Association.PublicIp' --output text --region ${AWS_REGION})
+                    echo "🌍 Public IP: $PUBLIC_IP"
+                    
+                    if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" == "None" ]; then
+                        echo "❌ Could not retrieve Public IP!"
+                        exit 1
+                    fi
+
+                    # Update Route53
+                    echo "🔄 Updating Route53 record for www.webbyftw.co.in..."
+                    HOSTED_ZONE_ID="Z0937327HD133Q6A55PH"
+                    
+                    cat <<EOF > change-batch.json
+{
+  "Comment": "Update record to point to ECS Task Public IP",
+  "Changes": [
+    {
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "www.webbyftw.co.in",
+        "Type": "A",
+        "TTL": 60,
+        "ResourceRecords": [
+          {
+            "Value": "${PUBLIC_IP}"
+          }
+        ]
+      }
+    }
+  ]
+}
+EOF
+                    aws route53 change-resource-record-sets --hosted-zone-id $HOSTED_ZONE_ID --change-batch file://change-batch.json
+                    echo "✅ DNS Update Submitted!"
+                '''
+            }
+        }
+
         stage('🏥 Health Check') {
             steps {
                 script {
                     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                    echo "🏥 Running Health Checks via ALB"
+                    echo "🏥 Running Health Checks (Direct)"
                     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 }
                 sh '''
-                    echo "⏳ Waiting 30s for new tasks to register with ALB..."
-                    sleep 30
+                    echo "⏳ Waiting 60s for service startup..."
+                    sleep 60
 
-                    # Check ALB target health
-                    echo "🔍 Checking ALB target group health..."
-                    TARGET_GROUP_ARN=$(aws cloudformation describe-stacks \\
-                        --stack-name ecs-service-${SERVICE_NAME} \\
-                        --query 'Stacks[0].Outputs[?OutputKey==`TargetGroupArn`].OutputValue' \\
-                        --output text 2>/dev/null || echo "")
+                    # Find the running task IP again to be sure
+                    TASK_ARN=$(aws ecs list-tasks --cluster ${CLUSTER_NAME} --service-name ${SERVICE_NAME} --desired-status RUNNING --query 'taskArns[0]' --output text --region ${AWS_REGION})
+                    ENI_ID=$(aws ecs describe-tasks --cluster ${CLUSTER_NAME} --tasks $TASK_ARN --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text --region ${AWS_REGION})
+                    PUBLIC_IP=$(aws ec2 describe-network-interfaces --network-interface-ids $ENI_ID --query 'NetworkInterfaces[0].Association.PublicIp' --output text --region ${AWS_REGION})
 
-                    if [ -z "$TARGET_GROUP_ARN" ]; then
-                        echo "⚠️  Could not find target group ARN from stack, checking via tags..."
-                        TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups \\
-                            --names frontend-tg \\
-                            --query 'TargetGroups[0].TargetGroupArn' \\
-                            --output text 2>/dev/null || echo "")
-                    fi
+                    echo "🔍 Checking Health at http://${PUBLIC_IP}:80/ ..."
 
-                    # Health check loop with ALB verification
                     HEALTH_CHECK_PASSED=false
-                    for i in {1..20}; do
-                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                        echo "Health Check Attempt $i/20"
-
-                        # Check endpoint health
-                        if curl -sf https://www.webbyftw.co.in/ > /dev/null 2>&1; then
-                            echo "✅ Endpoint health check passed!"
-
-                            # Verify ALB target health if we have target group ARN
-                            if [ -n "$TARGET_GROUP_ARN" ] && [ "$TARGET_GROUP_ARN" != "None" ]; then
-                                HEALTHY_COUNT=$(aws elbv2 describe-target-health \\
-                                    --target-group-arn "$TARGET_GROUP_ARN" \\
-                                    --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`] | length(@)' \\
-                                    --output text 2>/dev/null || echo "0")
-
-                                echo "📊 Healthy targets in ALB: $HEALTHY_COUNT"
-
-                                if [ "$HEALTHY_COUNT" -gt 0 ]; then
-                                    echo "✅ ALB has healthy targets!"
-                                    HEALTH_CHECK_PASSED=true
-                                    break
-                                else
-                                    echo "⏳ Waiting for targets to become healthy in ALB..."
-                                fi
-                            else
-                                echo "✅ Health check passed (ALB verification skipped)"
-                                HEALTH_CHECK_PASSED=true
-                                break
-                            fi
+                    for i in {1..10}; do
+                        echo "Attempt $i/10..."
+                        if curl -sf --connect-timeout 5 "http://${PUBLIC_IP}:80/"; then
+                            echo "✅ Health check passed!"
+                            HEALTH_CHECK_PASSED=true
+                            break
                         else
-                            echo "⏳ Endpoint not healthy yet, waiting... ($i/20)"
+                            echo "⏳ Waiting..."
+                            sleep 10
                         fi
-
-                        sleep 15
                     done
 
                     if [ "$HEALTH_CHECK_PASSED" = false ]; then
-                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                        echo "❌ HEALTH CHECK FAILED - Initiating rollback!"
-                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-                        # Read previous task definition
-                        PREVIOUS_TASK_DEF=$(cat /tmp/previous_task_def_frontend.txt 2>/dev/null || echo "NONE")
-
-                        if [ "$PREVIOUS_TASK_DEF" != "NONE" ] && [ -n "$PREVIOUS_TASK_DEF" ]; then
-                            echo "🔄 Rolling back to previous task definition: $PREVIOUS_TASK_DEF"
-
-                            aws ecs update-service \\
-                                --cluster ${CLUSTER_NAME} \\
-                                --service ${SERVICE_NAME} \\
-                                --task-definition "$PREVIOUS_TASK_DEF" \\
-                                --force-new-deployment \\
-                                --region ${AWS_REGION}
-
-                            echo "⏳ Waiting for rollback to complete..."
-                            sleep 30
-
-                            echo "❌ Deployment failed health checks and was rolled back!"
-                        else
-                            echo "⚠️  No previous deployment to rollback to. This was the first deployment."
-                            echo "❌ Health checks failed on initial deployment!"
-                        fi
-
-                        # Show recent logs to help debug
-                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                        echo "📋 Recent Container Logs (last 50 lines):"
-                        aws logs tail /ecs/auto-deploy-prod --follow --since 5m --filter-pattern "" --format short | head -50 || true
-
+                        echo "❌ Health Check Failed!"
+                        aws logs tail /ecs/auto-deploy-prod --follow --since 5m --format short | head -50 || true
                         exit 1
                     fi
-
-                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                    echo "✅ All health checks passed!"
-                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 '''
             }
         }
